@@ -1,0 +1,226 @@
+name: build-reshade
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream crosire/reshade tag to build (e.g. v6.8.0). Empty = latest vX.Y.Z tag."
+        required: false
+        type: string
+  schedule:
+    # Weekly
+    - cron: "17 4 * * 1"
+
+permissions: {}
+
+concurrency:
+  group: build-reshade
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      build: ${{ steps.exists.outputs.build }}
+    steps:
+      - name: Resolve upstream tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          upstream=https://github.com/crosire/reshade.git
+
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+            if ! git ls-remote --exit-code --tags "$upstream" "refs/tags/$tag" >/dev/null; then
+              echo "::error::Tag '$tag' does not exist in crosire/reshade"
+              exit 1
+            fi
+          else
+            # Stable releases only
+            tag="$(git ls-remote --tags --refs --sort=-v:refname "$upstream" 'v*' \
+              | awk '{print $2}' | sed 's#refs/tags/##' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)"
+          fi
+
+          echo "Resolved tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already released
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists here; skipping."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.meta.outputs.commit }}
+    steps:
+      - name: Checkout crosire/reshade @ ${{ needs.resolve.outputs.tag }}
+        uses: actions/checkout@v7
+        with:
+          repository: crosire/reshade
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          submodules: true
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify tag is resolvable (used by tools/update_version.ps1)
+        id: meta
+        shell: pwsh
+        run: |
+          $described = git describe --tags --exact-match
+          if ($LASTEXITCODE -ne 0) { throw "git describe failed; version.h would be 0.0.0" }
+          Write-Host "git describe: $described"
+          "commit=$(git rev-parse HEAD)" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Set up Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1.8.0
+        with:
+          cache: true
+
+      - name: Expose VK_SDK_PATH to MSBuild
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "$env:VULKAN_SDK\Bin\glslangValidator.exe")) {
+            throw "glslangValidator.exe not found under $env:VULKAN_SDK"
+          }
+          "VK_SDK_PATH=$env:VULKAN_SDK" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build ReShade (Release, 64-bit)
+        run: msbuild ReShade.sln /m /p:Configuration=Release /p:Platform=64-bit
+
+      - name: Check output
+        shell: pwsh
+        run: |
+          $dll = "bin/x64/Release/ReShade64.dll"
+          if (-not (Test-Path $dll)) { throw "$dll was not produced" }
+          (Get-Item $dll).VersionInfo | Format-List FileVersion, ProductVersion
+
+      - name: Collect license notices
+        # explicitly distribute licenses as well.
+        shell: bash
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          out=bin/x64/Release/LICENSES.txt
+          mkdir -p "$(dirname "$out")"
+          section() { printf '==== %s ====\n\n' "$1"; cat "$2"; printf '\n\n'; }
+
+          {
+            echo "ReShade64.dll is an unmodified build of ReShade ${TAG} (https://github.com/crosire/reshade),"
+            echo "compiled with Configuration=Release, Platform=64-bit. It is not an official build and is"
+            echo "not endorsed by Patrick Mours or the ReShade contributors."
+            echo
+            section "ReShade" LICENSE.md
+
+            for d in deps/*/; do
+              name="$(basename "$d")"
+              for f in "$d"LICENSE "$d"LICENSE.txt "$d"COPYING; do
+                if [ -f "$f" ]; then section "$name ($(basename "$f"))" "$f"; fi
+              done
+            done
+
+            printf '==== Notes ====\n\n'
+            echo "deps/khronos (gl.xml, vk.xml, wgl.xml; used to generate the glad loader):"
+            echo "  Copyright The Khronos Group Inc., Apache-2.0 (license text as in the openxr section above)."
+            echo "deps/fpng and deps/stb_image: public domain / Unlicense."
+            echo "res/fonts/forkawesome: Fork Awesome icon font, SIL Open Font License 1.1 (text below)."
+            echo
+            curl -fsSL https://raw.githubusercontent.com/spdx/license-list-data/main/text/OFL-1.1.txt
+          } > "$out"
+
+          echo "Wrote $(wc -l < "$out") lines to $out"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ReShade64
+          path: |
+            bin/x64/Release/ReShade64.dll
+            bin/x64/Release/LICENSES.txt
+          if-no-files-found: error
+
+  release:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ReShade64
+          path: dist
+
+      - name: Compute hashes
+        id: hash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum ReShade64.dll > ReShade64.dll.sha256
+          echo "hex=$(cut -d' ' -f1 ReShade64.dll.sha256)" >> "$GITHUB_OUTPUT"
+          echo "sri=sha256-$(openssl dgst -sha256 -binary ReShade64.dll | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          COMMIT: ${{ needs.build.outputs.commit }}
+          HEX: ${{ steps.hash.outputs.hex }}
+          SRI: ${{ steps.hash.outputs.sri }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/ReShade64.dll"
+
+          cat > notes.md <<EOF
+          Unofficial rebuild of [ReShade ${TAG}](https://github.com/crosire/reshade/tree/${TAG})
+          (upstream commit \`${COMMIT}\`), \`Release|64-bit\`, unmodified.
+          Not an official build and not endorsed by the ReShade authors.
+
+          ReShade is BSD-3-Clause. \`LICENSES.txt\` contains its license and the
+          notices for every bundled dependency, and must accompany the DLL.
+
+          | | |
+          |---|---|
+          | SHA-256 | \`${HEX}\` |
+          | SRI | \`${SRI}\` |
+
+          \`\`\`nix
+          pkgs.fetchurl {
+            url = "${url}";
+            hash = "${SRI}";
+          }
+          \`\`\`
+          EOF
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "ReShade ${TAG}" \
+            --notes-file notes.md \
+            dist/ReShade64.dll dist/ReShade64.dll.sha256 dist/LICENSES.txt
